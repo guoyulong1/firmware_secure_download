@@ -3,6 +3,9 @@
 
 #include "fsd/manifest.h"
 
+#include <unistd.h>
+
+#include <cstdlib>
 #include <fstream>
 #include <string>
 #include <string_view>
@@ -14,6 +17,26 @@
 
 namespace fsd {
 namespace {
+
+Status WriteExclusiveTemp(std::string_view payload,
+                          std::filesystem::path* path) {
+  std::string pattern =
+      (std::filesystem::temp_directory_path() / "fsd-XXXXXX").string();
+  const int descriptor = ::mkstemp(pattern.data());
+  if (descriptor < 0) {
+    return Status::Failure(ErrorCode::kIo,
+                           "cannot create the manifest self-test file");
+  }
+  const ssize_t wrote = ::write(descriptor, payload.data(), payload.size());
+  const int closed = ::close(descriptor);
+  *path = pattern;
+  if (wrote != static_cast<ssize_t>(payload.size()) || closed != 0) {
+    std::filesystem::remove(*path);
+    return Status::Failure(ErrorCode::kIo,
+                           "cannot write the manifest self-test file");
+  }
+  return Status::Ok();
+}
 
 constexpr std::uint64_t kMaxManifestBytes = 64 * 1024;
 constexpr std::size_t kMaxLineLength = 4096;
@@ -186,22 +209,18 @@ Status LoadManifest(const std::filesystem::path& path,
 }
 
 Status RunManifestSelfTest() {
-  const std::filesystem::path path =
-      std::filesystem::temp_directory_path() / "fsd-manifest-selftest.txt";
-  {
-    std::ofstream output(path, std::ios::trunc);
-    if (!output) {
-      return Status::Failure(ErrorCode::kIo,
-                             "cannot write the manifest self-test file");
-    }
-    output
-        << "# self-test\n"
-        << "name=self-test\n"
-        << "url=https://example.com/firmware.bin\n"
-        << "sha256="
-           "BA7816BF8F01CFEA414140DE5DAE2223B00361A396177A9CB410FF61F20015AD\n"
-        << "size=3\n"
-        << "output=/tmp/fsd-selftest.bin\n";
+  std::filesystem::path path;
+  if (Status status = WriteExclusiveTemp(
+          "# self-test\n"
+          "name=self-test\n"
+          "url=https://example.com/firmware.bin\n"
+          "sha256="
+          "BA7816BF8F01CFEA414140DE5DAE2223B00361A396177A9CB410FF61F20015AD\n"
+          "size=3\n"
+          "output=/tmp/fsd-selftest.bin\n",
+          &path);
+      !status.ok()) {
+    return status;
   }
 
   FirmwareManifest manifest;
@@ -218,13 +237,14 @@ Status RunManifestSelfTest() {
                            "manifest parse result did not match expectations");
   }
 
-  {
-    std::ofstream output(path, std::ios::trunc);
-    output
-        << "url=https://example.com/firmware.bin\n"
-        << "sha256="
-           "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad\n"
-        << "typo=1\n";
+  if (Status status = WriteExclusiveTemp(
+          "url=https://example.com/firmware.bin\n"
+          "sha256="
+          "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad\n"
+          "typo=1\n",
+          &path);
+      !status.ok()) {
+    return status;
   }
   FirmwareManifest rejected;
   const Status bad = LoadManifest(path, &rejected);
@@ -234,11 +254,13 @@ Status RunManifestSelfTest() {
                            "unknown manifest fields must be rejected");
   }
 
-  {
-    std::ofstream output(path, std::ios::trunc);
-    output << "url=https://example.com/firmware.bin\n"
-           << "md5=D41D8CD98F00B204E9800998ECF8427E\n"
-           << "output=/tmp/fsd-md5.bin\n";
+  if (Status status =
+          WriteExclusiveTemp("url=https://example.com/firmware.bin\n"
+                             "md5=D41D8CD98F00B204E9800998ECF8427E\n"
+                             "output=/tmp/fsd-md5.bin\n",
+                             &path);
+      !status.ok()) {
+    return status;
   }
   FirmwareManifest md5_only;
   const Status md5_loaded = LoadManifest(path, &md5_only);

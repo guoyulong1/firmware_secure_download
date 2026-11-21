@@ -8,7 +8,7 @@
 #define FSD_HTTP_CLIENT_H_
 
 #include <cstdint>
-#include <filesystem>
+#include <cstdio>
 #include <optional>
 #include <string>
 
@@ -19,7 +19,8 @@ namespace fsd {
 
 struct HttpRequest {
   std::string url;
-  std::filesystem::path destination;
+  // 调用方已经打开并锁住的临时文件。传输过程中不关闭它。
+  FILE* destination_file = nullptr;
   std::uint64_t resume_from = 0;
   std::uint64_t max_bytes = kDefaultMaxBytes;
   std::optional<std::uint64_t> expected_size;
@@ -42,8 +43,8 @@ class HttpClient {
  public:
   HttpClient() = default;
 
-  // 成功返回前，目标文件已 fflush 且 fsync。失败时保留已写入的前缀，
-  // 由上层决定删除还是续传。
+  // 成功返回前，目标文件已 fflush 且 fsync。不关闭 destination_file。
+  // 失败时保留已写入的前缀，由上层决定删除还是续传。
   [[nodiscard]] Status Download(const HttpRequest& request,
                                 HttpResult* result) const;
 };

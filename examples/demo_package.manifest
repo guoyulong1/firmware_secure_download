@@ -5,6 +5,7 @@
 # 若站点内容变化，SHA-256 校验会失败并删除临时文件，这是预期的安全行为。
 # 摘要采集日期：2026-11-20
 name=example-placeholder
-url=https://cdn.cnbj0.fds.api.mi-img.com/miio_fw/4d39f2d5857a93af74a29ad9e426c586_upd_xiaomi.vacuum.qv42gl.bin?GalaxyAccessKeyId=5721718224520&Expires=1809854785145&Signature=AcPPBFLUPlUSaZh0l/XdI4aVlgI=
-sha256=23eaf89d79dd7c36bdddde06a5f953dcd554c67f153c051be6289304878a26c2
-output=out/ota.brm
+url=https://example.com/
+sha256=25ddf2c883e0d1958ea971d279a7e4f0fd446724ee3db7db19dadabd4a62e484
+size=577
+output=out/example.html

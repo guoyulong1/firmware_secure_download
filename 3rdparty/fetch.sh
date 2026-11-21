@@ -17,9 +17,28 @@ have_tag() {
   [[ -f "${dest}/.fsd-source-tag" && "$(cat "${dest}/.fsd-source-tag")" == "${tag}" ]]
 }
 
+# 这两个值来自已经按下列标签解压过的归档。任一镜像字节不同就拒绝。
+openssl_sha256=796831ec533bf41998eaaee9d632d921b8a69f57394fa4086ff01a941113d26d
+curl_sha256=d0605d5883124ef5ae64c6d2b307e1417c482b362583b57491fdf37d9a99a792
+
+sha256_matches() {
+  local file="$1"
+  local expected="$2"
+  local actual
+  actual="$(sha256sum "${file}" | awk '{print $1}')"
+  if [[ "${actual}" != "${expected}" ]]; then
+    echo "checksum mismatch for ${file}" >&2
+    echo "expected ${expected}" >&2
+    echo "actual   ${actual}" >&2
+    rm -f "${file}"
+    return 1
+  fi
+}
+
 download() {
   local dest="$1"
-  shift
+  local expected="$2"
+  shift 2
   local url
   for url in "$@"; do
     echo "get ${url}"
@@ -28,7 +47,11 @@ download() {
       rm -f "${dest}"
       # codeload 不支持 Range，失败后整包重下，不使用续传。
       if curl --ipv4 --http1.1 -fL --max-time 0 -o "${dest}" "${url}"; then
-        return 0
+        if sha256_matches "${dest}" "${expected}"; then
+          return 0
+        fi
+        echo "rejected ${url}" >&2
+        break
       fi
       echo "retry ${attempt} ${url}" >&2
       sleep 2
@@ -66,7 +89,7 @@ extract_to() {
 if have_tag "${root}/openssl" "openssl-3.5.9"; then
   echo "keep openssl openssl-3.5.9"
 else
-  download "${work}/openssl.tar.gz" \
+  download "${work}/openssl.tar.gz" "${openssl_sha256}" \
     "https://codeload.github.com/openssl/openssl/tar.gz/refs/tags/openssl-3.5.9" \
     "https://github.com/openssl/openssl/releases/download/openssl-3.5.9/openssl-3.5.9.tar.gz"
   extract_to "${work}/openssl.tar.gz" "${root}/openssl" "openssl-3.5.9"
@@ -75,7 +98,7 @@ fi
 if have_tag "${root}/curl" "curl-8_23_0"; then
   echo "keep curl curl-8_23_0"
 else
-  download "${work}/curl.tar.gz" \
+  download "${work}/curl.tar.gz" "${curl_sha256}" \
     "https://codeload.github.com/curl/curl/tar.gz/refs/tags/curl-8_23_0" \
     "https://curl.se/download/curl-8.23.0.tar.gz"
   extract_to "${work}/curl.tar.gz" "${root}/curl" "curl-8_23_0"

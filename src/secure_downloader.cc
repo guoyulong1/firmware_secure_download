@@ -4,10 +4,14 @@
 #include "fsd/secure_downloader.h"
 
 #include <fcntl.h>
+#include <sys/file.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <algorithm>
+#include <cerrno>
 #include <cstdint>
+#include <cstdio>
 #include <filesystem>
 #include <iostream>
 #include <string>
@@ -18,6 +22,7 @@
 #include "fsd/md5.h"
 #include "fsd/sha256.h"
 #include "fsd/text_util.h"
+#include "fsd/url.h"
 
 namespace fsd {
 namespace {
@@ -40,6 +45,97 @@ class UniqueFd {
   int fd_;
 };
 
+class PartFile {
+ public:
+  PartFile() = default;
+  ~PartFile() { Close(); }
+
+  PartFile(const PartFile&) = delete;
+  PartFile& operator=(const PartFile&) = delete;
+
+  [[nodiscard]] bool is_open() const noexcept { return file_ != nullptr; }
+  [[nodiscard]] FILE* file() const noexcept { return file_; }
+  [[nodiscard]] std::uint64_t size() const noexcept { return size_; }
+
+  // append 为真时不创建文件。文件不存在则 *missing 为真且保持未打开。
+  Status Open(const std::filesystem::path& path, bool append, bool* missing) {
+    Close();
+    if (missing != nullptr) {
+      *missing = false;
+    }
+    int flags = O_CLOEXEC | O_NOFOLLOW | O_WRONLY;
+    if (append) {
+      flags |= O_APPEND;
+    } else {
+      flags |= O_CREAT | O_TRUNC;
+    }
+    const int raw = ::open(path.c_str(), flags, 0644);
+    if (raw < 0) {
+      if (append && errno == ENOENT) {
+        if (missing != nullptr) {
+          *missing = true;
+        }
+        return Status::Ok();
+      }
+      if (errno == ELOOP) {
+        return Status::Failure(ErrorCode::kInvalidArgument,
+                               "temporary file is a symbolic link");
+      }
+      return Status::Failure(
+          ErrorCode::kIo,
+          ErrnoMessage("failed to open the temporary firmware file"));
+    }
+    if (::flock(raw, LOCK_EX | LOCK_NB) != 0) {
+      const int saved = errno;
+      ::close(raw);
+      errno = saved;
+      if (saved == EWOULDBLOCK || saved == EAGAIN) {
+        return Status::Failure(ErrorCode::kIo,
+                               "another download is using this temporary file");
+      }
+      return Status::Failure(
+          ErrorCode::kIo,
+          ErrnoMessage("failed to lock the temporary firmware file"));
+    }
+    struct stat state {};
+    if (::fstat(raw, &state) != 0) {
+      const int saved = errno;
+      ::close(raw);
+      errno = saved;
+      return Status::Failure(
+          ErrorCode::kIo, ErrnoMessage("cannot read the temporary file size"));
+    }
+    if (!S_ISREG(state.st_mode) || state.st_size < 0) {
+      ::close(raw);
+      return Status::Failure(ErrorCode::kInvalidArgument,
+                             "temporary file is not a regular file");
+    }
+    FILE* opened = ::fdopen(raw, append ? "ab" : "wb");
+    if (opened == nullptr) {
+      const int saved = errno;
+      ::close(raw);
+      errno = saved;
+      return Status::Failure(
+          ErrorCode::kIo,
+          ErrnoMessage("failed to open the temporary firmware file"));
+    }
+    file_ = opened;
+    size_ = static_cast<std::uint64_t>(state.st_size);
+    return Status::Ok();
+  }
+
+  void Close() {
+    if (file_ != nullptr) {
+      std::fclose(file_);
+      file_ = nullptr;
+    }
+  }
+
+ private:
+  FILE* file_ = nullptr;
+  std::uint64_t size_ = 0;
+};
+
 std::filesystem::path PartialPath(const std::filesystem::path& output) {
   return std::filesystem::path(output.string() + ".part");
 }
@@ -53,263 +149,6 @@ struct VerifiedDigests {
   std::string sha256;
   std::string md5;
 };
-
-constexpr std::string_view kHttpsScheme = "https://";
-constexpr std::size_t kMaxUrlLength = 2048;
-// RFC 4291 §2.2 带 IPv4 尾的最长文本是 45 个字符：
-// xxxx:xxxx:xxxx:xxxx:xxxx:xxxx:255.255.255.255
-constexpr std::size_t kMaxIpv6TextLength = 45;
-
-bool IsHexDigit(char ch) {
-  return (ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f') ||
-         (ch >= 'A' && ch <= 'F');
-}
-
-bool IsIpv4(std::string_view host) {
-  int octets = 0;
-  while (!host.empty()) {
-    const std::size_t dot = host.find('.');
-    const bool last = dot == std::string_view::npos;
-    const std::string_view piece = last ? host : host.substr(0, dot);
-    if (piece.empty() || piece.size() > 3 ||
-        (piece.size() > 1 && piece.front() == '0')) {
-      return false;
-    }
-    int value = 0;
-    for (const char ch : piece) {
-      if (ch < '0' || ch > '9') {
-        return false;
-      }
-      value = value * 10 + (ch - '0');
-    }
-    if (value > 255) {
-      return false;
-    }
-    ++octets;
-    if (last) {
-      break;
-    }
-    host.remove_prefix(dot + 1);
-    if (host.empty()) {
-      return false;
-    }
-  }
-  return octets == 4;
-}
-
-// 解析 :: 的一侧。IPv4 尾只允许出现在整个地址的末尾。
-bool ParseIpv6Side(std::string_view side, bool allow_ipv4, int* groups) {
-  *groups = 0;
-  if (side.empty()) {
-    return true;
-  }
-  while (!side.empty()) {
-    const std::size_t colon = side.find(':');
-    const bool last = colon == std::string_view::npos;
-    const std::string_view piece = last ? side : side.substr(0, colon);
-    if (piece.empty()) {
-      return false;
-    }
-    if (piece.find('.') != std::string_view::npos) {
-      if (!allow_ipv4 || !last || !IsIpv4(piece)) {
-        return false;
-      }
-      *groups += 2;
-    } else {
-      if (piece.size() > 4) {
-        return false;
-      }
-      for (const char ch : piece) {
-        if (!IsHexDigit(ch)) {
-          return false;
-        }
-      }
-      *groups += 1;
-    }
-    if (last) {
-      break;
-    }
-    side.remove_prefix(colon + 1);
-    if (side.empty()) {
-      return false;
-    }
-  }
-  return true;
-}
-
-bool IsIpv6(std::string_view host) {
-  if (host.empty() || host.size() > kMaxIpv6TextLength) {
-    return false;
-  }
-  const std::size_t mark = host.find("::");
-  const bool compressed = mark != std::string_view::npos;
-  if (compressed && host.find("::", mark + 2) != std::string_view::npos) {
-    return false;
-  }
-  int left = 0;
-  int right = 0;
-  if (!compressed) {
-    return ParseIpv6Side(host, true, &left) && left == 8;
-  }
-  // IPv4 尾只能在右侧，左侧出现点分地址不是合法写法。
-  if (!ParseIpv6Side(host.substr(0, mark), false, &left) ||
-      !ParseIpv6Side(host.substr(mark + 2), true, &right)) {
-    return false;
-  }
-  // :: 至少要顶替一组零，所以显式组数必须小于 8。
-  return left + right < 8;
-}
-
-bool IsDnsName(std::string_view host) {
-  if (host.empty() || host.size() > 253) {
-    return false;
-  }
-  if (host.back() == '.') {
-    host.remove_suffix(1);
-    if (host.empty() || host.size() > 253) {
-      return false;
-    }
-  }
-  int label_length = 0;
-  char previous = '.';
-  for (const char ch : host) {
-    if (ch == '.') {
-      if (label_length == 0 || previous == '-') {
-        return false;
-      }
-      label_length = 0;
-      previous = ch;
-      continue;
-    }
-    const bool alnum = (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') ||
-                       (ch >= '0' && ch <= '9');
-    if (!alnum && ch != '-') {
-      return false;
-    }
-    if (label_length == 0 && ch == '-') {
-      return false;
-    }
-    if (++label_length > 63) {
-      return false;
-    }
-    previous = ch;
-  }
-  return label_length > 0 && previous != '-';
-}
-
-// 空串被 ParseUint64 拒绝。"080" 按十进制收成 80，符合 RFC 3986 的 *DIGIT。
-// 端口没有 IPv4 那种八进制歧义，所以保留前导零。
-bool IsPort(std::string_view port) {
-  const std::optional<std::uint64_t> value = ParseUint64(port);
-  return value.has_value() && *value >= 1 && *value <= 65535;
-}
-
-Status InvalidHost() {
-  return Status::Failure(ErrorCode::kInvalidArgument, "URL host is invalid");
-}
-
-Status ValidateAuthority(std::string_view authority) {
-  if (authority.empty()) {
-    return InvalidHost();
-  }
-  if (authority.find('@') != std::string_view::npos) {
-    return Status::Failure(ErrorCode::kInvalidArgument,
-                           "URL contains user info that does not belong in a "
-                           "firmware URL");
-  }
-
-  std::string_view host;
-  std::optional<std::string_view> port;
-  if (authority.front() == '[') {
-    const std::size_t close = authority.find(']');
-    if (close == std::string_view::npos) {
-      return InvalidHost();
-    }
-    host = authority.substr(1, close - 1);
-    const std::string_view tail = authority.substr(close + 1);
-    if (!tail.empty()) {
-      if (tail.front() != ':') {
-        return InvalidHost();
-      }
-      port = tail.substr(1);
-    }
-    if (!IsIpv6(host)) {
-      return InvalidHost();
-    }
-  } else {
-    const std::size_t colon = authority.find(':');
-    if (colon == std::string_view::npos) {
-      host = authority;
-    } else if (authority.find(':', colon + 1) != std::string_view::npos) {
-      return InvalidHost();
-    } else {
-      host = authority.substr(0, colon);
-      port = authority.substr(colon + 1);
-    }
-    // 只含数字和点就按 IPv4 检查。999.1.1.1 这类看起来像地址但不合法的写法
-    // 直接拒绝，不退回 DNS 名称。
-    const bool dotted_decimal =
-        !host.empty() &&
-        host.find_first_not_of("0123456789.") == std::string_view::npos;
-    if (host.empty() || (dotted_decimal ? !IsIpv4(host) : !IsDnsName(host))) {
-      return InvalidHost();
-    }
-  }
-  if (port.has_value() && !IsPort(*port)) {
-    return Status::Failure(ErrorCode::kInvalidArgument, "URL port is invalid");
-  }
-  return Status::Ok();
-}
-
-// curl 会把非法的 % 序列原样发出，所以 path、query、fragment 在这里拦截。
-Status ValidatePercentEncoding(std::string_view text) {
-  for (std::size_t index = 0; index < text.size(); ++index) {
-    if (text[index] != '%') {
-      continue;
-    }
-    if (index + 2 >= text.size() || !IsHexDigit(text[index + 1]) ||
-        !IsHexDigit(text[index + 2])) {
-      return Status::Failure(ErrorCode::kInvalidArgument,
-                             "URL contains an invalid percent-encoding");
-    }
-    index += 2;
-  }
-  return Status::Ok();
-}
-
-Status ValidateUrl(std::string_view url) {
-  if (url.size() < kHttpsScheme.size() || url.size() > kMaxUrlLength) {
-    return Status::Failure(ErrorCode::kInvalidArgument,
-                           "URL length is invalid");
-  }
-  for (const char ch : url) {
-    const auto byte = static_cast<unsigned char>(ch);
-    if (byte <= 0x20 || byte >= 0x7F) {
-      return Status::Failure(ErrorCode::kInvalidArgument,
-                             "URL contains whitespace, a control character, or "
-                             "a non-ASCII byte");
-    }
-  }
-  if (!StartsWithIgnoreCase(url, kHttpsScheme)) {
-    return Status::Failure(
-        ErrorCode::kProtocol,
-        "firmware packages can be downloaded only over HTTPS");
-  }
-
-  const std::string_view rest = url.substr(kHttpsScheme.size());
-  std::size_t authority_end = rest.size();
-  for (const char boundary : {'/', '?', '#'}) {
-    const std::size_t pos = rest.find(boundary);
-    if (pos != std::string_view::npos) {
-      authority_end = std::min(authority_end, pos);
-    }
-  }
-  if (Status status = ValidateAuthority(rest.substr(0, authority_end));
-      !status.ok()) {
-    return status;
-  }
-  return ValidatePercentEncoding(rest.substr(authority_end));
-}
 
 Status ValidateOptions(const DownloadOptions& options,
                        ExpectedDigests* expected) {
@@ -338,6 +177,10 @@ Status ValidateOptions(const DownloadOptions& options,
   if (options.max_bytes == 0) {
     return Status::Failure(ErrorCode::kInvalidArgument,
                            "the size limit must be greater than 0");
+  }
+  if (options.expected_size.has_value() && *options.expected_size == 0) {
+    return Status::Failure(ErrorCode::kInvalidArgument,
+                           "declared size must be greater than 0");
   }
   if (options.expected_size.has_value() &&
       *options.expected_size > options.max_bytes) {
@@ -474,7 +317,8 @@ Status SyncDirectory(const std::filesystem::path& directory) {
 
 Status Publish(const std::filesystem::path& part,
                const DownloadOptions& options, std::uint64_t bytes,
-               const VerifiedDigests& digests, std::string_view effective_url) {
+               const VerifiedDigests& digests, std::string_view url,
+               bool transferred) {
   std::error_code error;
   // 固件包是数据文件。去掉可执行位，避免把下载物直接当成程序跑起来。
   std::filesystem::permissions(part,
@@ -526,7 +370,8 @@ Status Publish(const std::filesystem::path& part,
   if (!digests.md5.empty()) {
     std::cout << "  MD5: " << digests.md5 << '\n';
   }
-  std::cout << "  final URL: " << effective_url << '\n';
+  std::cout << (transferred ? "  final URL: " : "  requested URL: ") << url
+            << '\n';
   if (!digests.sha256.empty()) {
     std::cout << "  note: TLS and SHA-256 checks passed. Publisher signature "
                  "verification is separate.\n";
@@ -537,12 +382,11 @@ Status Publish(const std::filesystem::path& part,
   return Status::Ok();
 }
 
-Status DownloadOnce(const DownloadOptions& options,
-                    const std::filesystem::path& part,
+Status DownloadOnce(const DownloadOptions& options, FILE* destination,
                     std::uint64_t resume_from, HttpResult* result) {
   HttpRequest request;
   request.url = options.url;
-  request.destination = part;
+  request.destination_file = destination;
   request.resume_from = resume_from;
   request.max_bytes = options.max_bytes;
   request.expected_size = options.expected_size;
@@ -569,39 +413,54 @@ Status SecureDownloader::Download(const DownloadOptions& options) const {
   }
 
   const std::filesystem::path part = PartialPath(options.output_path);
+  PartFile part_file;
   std::uint64_t resume_from = 0;
-  std::error_code error;
-  if (options.resume && std::filesystem::exists(part, error)) {
-    const auto existing = std::filesystem::file_size(part, error);
-    if (error) {
-      return Status::Failure(
-          ErrorCode::kIo,
-          "cannot read the temporary file size: " + error.message());
+  if (options.resume) {
+    bool missing = false;
+    if (Status status = part_file.Open(part, true, &missing); !status.ok()) {
+      return status;
     }
-    if (existing > options.max_bytes) {
-      return Status::Failure(ErrorCode::kSizeLimit,
-                             "existing temporary file exceeds the size limit");
+    if (!missing) {
+      const std::uint64_t existing = part_file.size();
+      if (existing > options.max_bytes) {
+        part_file.Close();
+        return Status::Failure(
+            ErrorCode::kSizeLimit,
+            "existing temporary file exceeds the size limit");
+      }
+      if (options.expected_size.has_value() &&
+          existing > *options.expected_size) {
+        part_file.Close();
+        RemoveQuietly(part);
+      } else if (options.expected_size.has_value() &&
+                 existing == *options.expected_size &&
+                 (!expected.sha256.empty() || !expected.md5.empty())) {
+        VerifiedDigests verified;
+        const Status matched = VerifyFileDigests(part, expected, &verified);
+        if (matched.ok()) {
+          const Status published =
+              Publish(part, options, existing, verified, options.url, false);
+          part_file.Close();
+          return published;
+        }
+        part_file.Close();
+        if (matched.code() != ErrorCode::kChecksumMismatch) {
+          return matched;
+        }
+        // 长度碰巧相同但摘要不对，这段前缀不能再续。
+        std::cerr << "temporary file has the declared size but the digest does "
+                     "not match; discarding it and downloading again\n";
+        RemoveQuietly(part);
+      } else if (existing > 0) {
+        resume_from = existing;
+      } else {
+        part_file.Close();
+      }
     }
-    if (options.expected_size.has_value() &&
-        existing > *options.expected_size) {
-      RemoveQuietly(part);
-    } else if (options.expected_size.has_value() &&
-               existing == *options.expected_size &&
-               (!expected.sha256.empty() || !expected.md5.empty())) {
-      VerifiedDigests verified;
-      const Status matched = VerifyFileDigests(part, expected, &verified);
-      if (matched.ok()) {
-        return Publish(part, options, existing, verified, options.url);
-      }
-      if (matched.code() != ErrorCode::kChecksumMismatch) {
-        return matched;
-      }
-      // 长度碰巧相同但摘要不对，这段前缀不能再续。
-      std::cerr << "temporary file has the declared size but the digest does "
-                   "not match; discarding it and downloading again\n";
-      RemoveQuietly(part);
-    } else if (existing > 0) {
-      resume_from = existing;
+  }
+  if (!part_file.is_open()) {
+    if (Status status = part_file.Open(part, false, nullptr); !status.ok()) {
+      return status;
     }
   }
 
@@ -619,28 +478,43 @@ Status SecureDownloader::Download(const DownloadOptions& options) const {
                "minimum, HTTPS only\n";
 
   HttpResult transferred;
-  Status transfer = DownloadOnce(options, part, resume_from, &transferred);
+  Status transfer =
+      DownloadOnce(options, part_file.file(), resume_from, &transferred);
   if (!transfer.ok() && resume_from > 0 &&
       transfer.code() == ErrorCode::kRangeNotSupported) {
     std::cerr << "server did not provide a usable range; downloading the full "
                  "file\n";
+    part_file.Close();
     RemoveQuietly(part);
     resume_from = 0;
-    transfer = DownloadOnce(options, part, 0, &transferred);
+    if (Status status = part_file.Open(part, false, nullptr); !status.ok()) {
+      return status;
+    }
+    transfer = DownloadOnce(options, part_file.file(), 0, &transferred);
   }
   if (!transfer.ok()) {
     // 摘要还没算。网络中断且用户要求续传时保留前缀；其余失败删掉，
     // 避免下一次把不可信的半包当成进度。
-    if (!options.resume || transfer.code() == ErrorCode::kInvalidArgument ||
-        transfer.code() == ErrorCode::kSizeLimit ||
-        transfer.code() == ErrorCode::kProtocol) {
+    const bool remove = !options.resume ||
+                        transfer.code() == ErrorCode::kInvalidArgument ||
+                        transfer.code() == ErrorCode::kSizeLimit ||
+                        transfer.code() == ErrorCode::kProtocol;
+    part_file.Close();
+    if (remove) {
       RemoveQuietly(part);
     }
     return transfer;
   }
 
+  if (transferred.bytes_on_disk == 0) {
+    part_file.Close();
+    RemoveQuietly(part);
+    return Status::Failure(ErrorCode::kInvalidArgument,
+                           "downloaded firmware package is empty");
+  }
   if (options.expected_size.has_value() &&
       transferred.bytes_on_disk != *options.expected_size) {
+    part_file.Close();
     RemoveQuietly(part);
     return Status::Failure(ErrorCode::kInvalidArgument,
                            "downloaded size " +
@@ -653,12 +527,15 @@ Status SecureDownloader::Download(const DownloadOptions& options) const {
   if (!expected.sha256.empty() || !expected.md5.empty()) {
     if (Status status = VerifyFileDigests(part, expected, &verified);
         !status.ok()) {
+      part_file.Close();
       RemoveQuietly(part);
       return status;
     }
   }
-  return Publish(part, options, transferred.bytes_on_disk, verified,
-                 transferred.effective_url);
+  const Status published = Publish(part, options, transferred.bytes_on_disk,
+                                   verified, transferred.effective_url, true);
+  part_file.Close();
+  return published;
 }
 
 }  // namespace fsd

@@ -4,8 +4,10 @@
 #include "fsd/sha256.h"
 
 #include <openssl/evp.h>
+#include <unistd.h>
 
 #include <array>
+#include <cstdlib>
 #include <fstream>
 #include <system_error>
 #include <utility>
@@ -187,15 +189,20 @@ Status RunSha256SelfTest() {
                            "SHA-256 hexadecimal format check failed");
   }
 
-  const std::filesystem::path path =
-      std::filesystem::temp_directory_path() / "fsd-sha256-selftest.bin";
-  {
-    std::ofstream output(path, std::ios::binary | std::ios::trunc);
-    if (!output) {
-      return Status::Failure(ErrorCode::kIo,
-                             "cannot write the SHA-256 self-test file");
-    }
-    output << kAbc;
+  std::string pattern =
+      (std::filesystem::temp_directory_path() / "fsd-XXXXXX").string();
+  const int descriptor = ::mkstemp(pattern.data());
+  if (descriptor < 0) {
+    return Status::Failure(ErrorCode::kIo,
+                           "cannot create the SHA-256 self-test file");
+  }
+  const std::filesystem::path path = pattern;
+  const ssize_t wrote = ::write(descriptor, kAbc.data(), kAbc.size());
+  const int closed = ::close(descriptor);
+  if (wrote != static_cast<ssize_t>(kAbc.size()) || closed != 0) {
+    std::filesystem::remove(path);
+    return Status::Failure(ErrorCode::kIo,
+                           "cannot write the SHA-256 self-test file");
   }
   const Sha256Digest file_digest = HashFile(path);
   std::error_code remove_error;

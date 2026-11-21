@@ -4,10 +4,13 @@
 #include "fsd/http_client.h"
 
 #include <curl/curl.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <algorithm>
+#include <cerrno>
 #include <charconv>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <iostream>
@@ -19,19 +22,10 @@
 #include <utility>
 
 #include "fsd/text_util.h"
+#include "fsd/url.h"
 
 namespace fsd {
 namespace {
-
-struct FileDeleter {
-  void operator()(FILE* file) const noexcept {
-    if (file != nullptr) {
-      std::fclose(file);
-    }
-  }
-};
-
-using FilePtr = std::unique_ptr<FILE, FileDeleter>;
 
 struct CurlDeleter {
   void operator()(CURL* curl) const noexcept {
@@ -73,6 +67,9 @@ struct TransferContext {
   bool range_rejected = false;
   bool header_invalid = false;
   bool progress_drawn = false;
+  bool saw_location = false;
+  int saved_errno = 0;
+  std::string location;
   bool tty = false;
   int last_percent = -1;
   std::string detail;
@@ -111,8 +108,18 @@ void NoteContentLength(TransferContext* ctx, std::string_view value) {
     ctx->detail = "Content-Length is not an integer";
     return;
   }
+  if (ctx->saw_content_length && ctx->content_length != length) {
+    ctx->header_invalid = true;
+    ctx->detail = "conflicting Content-Length headers";
+    return;
+  }
   ctx->content_length = *length;
   ctx->saw_content_length = true;
+}
+
+bool IsRedirect(long status) {
+  return status == 301 || status == 302 || status == 303 || status == 307 ||
+         status == 308;
 }
 
 std::size_t WriteHeader(char* buffer, std::size_t size, std::size_t count,
@@ -134,6 +141,9 @@ std::size_t WriteHeader(char* buffer, std::size_t size, std::size_t count,
     ctx->http_status = *status;
     ctx->content_length.reset();
     ctx->saw_content_length = false;
+    ctx->location.clear();
+    ctx->saw_location = false;
+    ctx->checked_body = false;
     return bytes;
   }
 
@@ -148,6 +158,15 @@ std::size_t WriteHeader(char* buffer, std::size_t size, std::size_t count,
     if (ctx->header_invalid) {
       return 0;
     }
+  } else if (EqualsIgnoreCase(name, "Location")) {
+    const std::string next(value);
+    if (ctx->saw_location && ctx->location != next) {
+      ctx->header_invalid = true;
+      ctx->detail = "conflicting Location headers";
+      return 0;
+    }
+    ctx->location = next;
+    ctx->saw_location = true;
   }
   return bytes;
 }
@@ -164,6 +183,9 @@ std::size_t WriteBody(char* buffer, std::size_t size, std::size_t count,
   }
   const std::size_t bytes = size * count;
   auto* ctx = static_cast<TransferContext*>(userdata);
+  if (IsRedirect(ctx->http_status)) {
+    return bytes;
+  }
   if (!ctx->checked_body) {
     ctx->checked_body = true;
     if (ctx->resume_from > 0 && ctx->http_status != 0 &&
@@ -218,6 +240,7 @@ std::size_t WriteBody(char* buffer, std::size_t size, std::size_t count,
   const std::size_t written = std::fwrite(buffer, 1, bytes, ctx->file);
   if (written != bytes) {
     ctx->io_error = true;
+    ctx->saved_errno = errno;
     return written;
   }
   ctx->total_written += written;
@@ -378,9 +401,13 @@ Status MapCurlFailure(CURLcode code, const TransferContext& ctx,
         ctx.detail.empty() ? "server does not support resume" : ctx.detail);
   }
   if (ctx.io_error) {
-    return Status::Failure(
-        ErrorCode::kIo,
-        ErrnoMessage("failed to write the temporary firmware file"));
+    std::string message = "failed to write the temporary firmware file";
+    if (ctx.saved_errno != 0) {
+      const std::error_code error(ctx.saved_errno, std::generic_category());
+      message.append(": ");
+      message.append(error.message());
+    }
+    return Status::Failure(ErrorCode::kIo, message);
   }
   if (ctx.header_invalid) {
     return Status::Failure(ErrorCode::kHttp, ctx.detail.empty()
@@ -434,6 +461,33 @@ bool FitsCurlOffset(std::uint64_t value) {
          static_cast<std::uint64_t>(std::numeric_limits<curl_off_t>::max());
 }
 
+void ResetHop(TransferContext* context) {
+  context->http_status = 0;
+  context->content_length.reset();
+  context->saw_content_length = false;
+  context->checked_body = false;
+  context->location.clear();
+  context->saw_location = false;
+  context->header_invalid = false;
+  context->detail.clear();
+}
+
+Status BytesOnDisk(FILE* file, std::uint64_t* bytes) {
+  const int fd = fileno(file);
+  if (fd < 0) {
+    return Status::Failure(ErrorCode::kIo,
+                           "cannot determine the temporary file size");
+  }
+  struct stat state {};
+  if (::fstat(fd, &state) != 0 || state.st_size < 0) {
+    return Status::Failure(
+        ErrorCode::kIo,
+        ErrnoMessage("cannot determine the temporary file size"));
+  }
+  *bytes = static_cast<std::uint64_t>(state.st_size);
+  return Status::Ok();
+}
+
 }  // namespace
 
 Status HttpClient::Download(const HttpRequest& request,
@@ -441,6 +495,10 @@ Status HttpClient::Download(const HttpRequest& request,
   if (result == nullptr) {
     return Status::Failure(ErrorCode::kInvalidArgument,
                            "download result argument is null");
+  }
+  if (request.destination_file == nullptr) {
+    return Status::Failure(ErrorCode::kInvalidArgument,
+                           "temporary file is not open");
   }
   if (Status ready = EnsureCurlReady(); !ready.ok()) {
     return ready;
@@ -452,24 +510,6 @@ Status HttpClient::Download(const HttpRequest& request,
         "offset or size limit exceeds the range libcurl can represent");
   }
 
-  std::error_code error;
-  if (request.resume_from > 0) {
-    const auto size = std::filesystem::file_size(request.destination, error);
-    if (error || size != request.resume_from) {
-      return Status::Failure(
-          ErrorCode::kIo,
-          "resume offset does not match the temporary file size");
-    }
-  }
-
-  const char* const mode = request.resume_from > 0 ? "ab" : "wb";
-  FilePtr file(std::fopen(request.destination.c_str(), mode));
-  if (!file) {
-    return Status::Failure(
-        ErrorCode::kIo,
-        ErrnoMessage("failed to open the temporary firmware file"));
-  }
-
   CurlPtr curl(curl_easy_init());
   if (!curl) {
     return Status::Failure(ErrorCode::kNetwork,
@@ -477,7 +517,7 @@ Status HttpClient::Download(const HttpRequest& request,
   }
 
   TransferContext context;
-  context.file = file.get();
+  context.file = request.destination_file;
   context.max_bytes = request.max_bytes;
   context.resume_from = request.resume_from;
   context.total_written = request.resume_from;
@@ -492,14 +532,7 @@ Status HttpClient::Download(const HttpRequest& request,
   if (Status status = ApplySecurityOptions(curl.get(), request); !status.ok()) {
     return status;
   }
-  if (Status status = set(CURLOPT_URL, request.url.c_str()); !status.ok()) {
-    return status;
-  }
-  if (Status status = set(CURLOPT_FOLLOWLOCATION, 1L); !status.ok()) {
-    return status;
-  }
-  if (Status status = set(CURLOPT_MAXREDIRS, request.max_redirects);
-      !status.ok()) {
+  if (Status status = set(CURLOPT_FOLLOWLOCATION, 0L); !status.ok()) {
     return status;
   }
   if (Status status = set(CURLOPT_FAILONERROR, 1L); !status.ok()) {
@@ -511,16 +544,6 @@ Status HttpClient::Download(const HttpRequest& request,
   if (Status status = set(CURLOPT_TCP_KEEPALIVE, 1L); !status.ok()) {
     return status;
   }
-  if (Status status =
-          set(CURLOPT_CONNECTTIMEOUT, request.connect_timeout_seconds);
-      !status.ok()) {
-    return status;
-  }
-  if (Status status = set(CURLOPT_TIMEOUT, request.transfer_timeout_seconds);
-      !status.ok()) {
-    return status;
-  }
-  // 长时间没有任何进展就放弃，避免半开连接占着临时文件。
   if (Status status = set(CURLOPT_LOW_SPEED_LIMIT, 1024L); !status.ok()) {
     return status;
   }
@@ -569,51 +592,102 @@ Status HttpClient::Download(const HttpRequest& request,
     }
   }
 
-  const CURLcode perform = curl_easy_perform(curl.get());
-  if (context.progress_drawn && context.tty) {
-    std::cerr << '\n';
-  }
+  const auto deadline = std::chrono::steady_clock::now() +
+                        std::chrono::seconds(request.transfer_timeout_seconds);
+  std::string current = request.url;
+  std::string final_url;
+  for (long hop = 0; hop <= request.max_redirects; ++hop) {
+    if (Status status = ValidateUrl(current); !status.ok()) {
+      return status;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (now >= deadline) {
+      return Status::Failure(ErrorCode::kNetwork, "transfer timed out");
+    }
+    const auto remaining_count =
+        std::chrono::duration_cast<std::chrono::seconds>(deadline - now)
+            .count();
+    long remaining =
+        remaining_count > 0 ? static_cast<long>(remaining_count) : 1;
+    if (remaining > request.transfer_timeout_seconds) {
+      remaining = request.transfer_timeout_seconds;
+    }
+    const long connect = std::min(request.connect_timeout_seconds, remaining);
+    ResetHop(&context);
+    errbuf[0] = '\0';
+    if (Status status = set(CURLOPT_URL, current.c_str()); !status.ok()) {
+      return status;
+    }
+    if (Status status = set(CURLOPT_CONNECTTIMEOUT, connect); !status.ok()) {
+      return status;
+    }
+    if (Status status = set(CURLOPT_TIMEOUT, remaining); !status.ok()) {
+      return status;
+    }
 
-  long response_code = 0;
-  curl_easy_getinfo(curl.get(), CURLINFO_RESPONSE_CODE, &response_code);
-  if (context.http_status == 0) {
-    context.http_status = response_code;
+    const CURLcode perform = curl_easy_perform(curl.get());
+    if (context.progress_drawn && context.tty) {
+      std::cerr << '\n';
+      context.progress_drawn = false;
+    }
+    long response_code = 0;
+    curl_easy_getinfo(curl.get(), CURLINFO_RESPONSE_CODE, &response_code);
+    if (context.http_status == 0) {
+      context.http_status = response_code;
+    }
+    if (perform != CURLE_OK || context.size_exceeded || context.size_mismatch ||
+        context.range_rejected || context.io_error || context.header_invalid) {
+      const CURLcode reported =
+          perform == CURLE_OK ? CURLE_WRITE_ERROR : perform;
+      return MapCurlFailure(reported, context, errbuf, response_code);
+    }
+    if (IsRedirect(context.http_status)) {
+      if (hop == request.max_redirects) {
+        return Status::Failure(ErrorCode::kProtocol,
+                               "redirect count exceeds the limit");
+      }
+      if (!context.saw_location) {
+        return Status::Failure(ErrorCode::kProtocol,
+                               "redirect is missing a Location header");
+      }
+      std::string next;
+      if (Status status = ResolveRedirect(current, context.location, &next);
+          !status.ok()) {
+        return status;
+      }
+      if (Status status = ValidateUrl(next); !status.ok()) {
+        return status;
+      }
+      current = std::move(next);
+      continue;
+    }
+    if (context.http_status != 200 && context.http_status != 206) {
+      return Status::Failure(ErrorCode::kHttp,
+                             "HTTP status " +
+                                 std::to_string(context.http_status) +
+                                 " is not acceptable");
+    }
+    final_url = current;
+    break;
   }
-
-  char* effective = nullptr;
-  curl_easy_getinfo(curl.get(), CURLINFO_EFFECTIVE_URL, &effective);
-
-  if (perform != CURLE_OK || context.size_exceeded || context.size_mismatch ||
-      context.range_rejected || context.io_error || context.header_invalid) {
-    const CURLcode reported = perform == CURLE_OK ? CURLE_WRITE_ERROR : perform;
-    return MapCurlFailure(reported, context, errbuf, response_code);
+  if (final_url.empty()) {
+    return Status::Failure(ErrorCode::kProtocol,
+                           "redirect count exceeds the limit");
   }
-  if (response_code != 200 && response_code != 206) {
-    return Status::Failure(
-        ErrorCode::kHttp,
-        "HTTP status " + std::to_string(response_code) + " is not acceptable");
-  }
-
-  if (Status status = SyncFile(file.get()); !status.ok()) {
+  if (Status status = ValidateUrl(final_url); !status.ok()) {
     return status;
   }
-  file.reset();
-
-  const auto bytes = std::filesystem::file_size(request.destination, error);
-  if (error) {
-    return Status::Failure(
-        ErrorCode::kIo,
-        "cannot determine the temporary file size: " + error.message());
+  if (Status status = SyncFile(request.destination_file); !status.ok()) {
+    return status;
   }
-
-  result->http_status = response_code;
+  std::uint64_t bytes = 0;
+  if (Status status = BytesOnDisk(request.destination_file, &bytes);
+      !status.ok()) {
+    return status;
+  }
+  result->http_status = context.http_status;
   result->bytes_on_disk = bytes;
-  result->effective_url =
-      effective == nullptr ? std::string() : std::string(effective);
-  if (!StartsWithIgnoreCase(result->effective_url, "https://")) {
-    return Status::Failure(ErrorCode::kProtocol,
-                           "final URL is not HTTPS: " + result->effective_url);
-  }
+  result->effective_url = final_url;
   return Status::Ok();
 }
 

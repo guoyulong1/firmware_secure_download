@@ -4,8 +4,10 @@
 #include "fsd/md5.h"
 
 #include <openssl/evp.h>
+#include <unistd.h>
 
 #include <array>
+#include <cstdlib>
 #include <fstream>
 #include <system_error>
 #include <utility>
@@ -172,14 +174,18 @@ Status RunMd5SelfTest() {
                            "MD5 hexadecimal format check failed");
   }
 
-  const std::filesystem::path path =
-      std::filesystem::temp_directory_path() / "fsd-md5-selftest.bin";
-  {
-    std::ofstream output(path, std::ios::binary | std::ios::trunc);
-    if (!output) {
-      return Status::Failure(ErrorCode::kIo,
-                             "cannot write the MD5 self-test file");
-    }
+  std::string pattern =
+      (std::filesystem::temp_directory_path() / "fsd-XXXXXX").string();
+  const int descriptor = ::mkstemp(pattern.data());
+  if (descriptor < 0) {
+    return Status::Failure(ErrorCode::kIo,
+                           "cannot create the MD5 self-test file");
+  }
+  const std::filesystem::path path = pattern;
+  if (::close(descriptor) != 0) {
+    std::filesystem::remove(path);
+    return Status::Failure(ErrorCode::kIo,
+                           "cannot create the MD5 self-test file");
   }
   const Md5Digest file_digest = HashFileMd5(path);
   std::error_code remove_error;

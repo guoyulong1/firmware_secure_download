@@ -101,6 +101,7 @@ add_executable(firmware_secure_download
   src/md5.cc
   src/manifest.cc
   src/http_client.cc
+  src/url.cc
   src/secure_downloader.cc
   src/main.cc)
 
