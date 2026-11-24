@@ -12,3 +12,7 @@
 /3rdparty/openssl/
 /3rdparty/curl/
 /3rdparty/.cache/
+
+# SSH 密钥与临时 Python 依赖（本机/沙箱专用，绝不可入库）。
+/.ssh/
+/.ssh-py/
