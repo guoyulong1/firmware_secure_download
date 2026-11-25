@@ -14,12 +14,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: 缓存第三方源码（OpenSSL/curl）
+      - name: 缓存第三方源码（OpenSSL/curl/googletest）
         uses: actions/cache@v4
         with:
           path: |
             3rdparty/openssl
             3rdparty/curl
+            3rdparty/googletest
           key: 3rdparty-${{ hashFiles('3rdparty/fetch.sh') }}
 
       - name: 拉取第三方源码（缓存未命中时）
@@ -32,3 +33,6 @@ jobs:
 
       - name: 本地自检
         run: ./build/firmware_secure_download --self-test
+
+      - name: 单元测试（ctest + GoogleTest）
+        run: ctest --test-dir build --output-on-failure
