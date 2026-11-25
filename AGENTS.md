@@ -25,9 +25,9 @@
 ./scripts/verify.sh
 ```
 
-等价于：`./3rdparty/fetch.sh`（首次，拉取并校验 curl/OpenSSL 源码）→ `cmake -S . -B build` → `cmake --build build` → `./build/firmware_secure_download --self-test`。
+等价于：`./3rdparty/fetch.sh`（首次，拉取并校验 curl/OpenSSL/googletest 源码）→ `cmake -S . -B build` → `cmake --build build` → `./build/firmware_secure_download --self-test` → `ctest --test-dir build --output-on-failure`。
 
-**验证标准**：`--self-test` 退出码 0 是底线；失败即视为改动有问题。改动涉及网络/TLS/IO/下载编排时，还需在真机跑一次真实下载验证。
+**验证标准**：`--self-test` 退出码 0 是底线；GoogleTest 单元测试（ctest）全绿。失败即视为改动有问题。改动涉及网络/TLS/IO/下载编排时，还需在真机跑一次真实下载验证。
 
 ### 真机验证（板载）
 

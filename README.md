@@ -24,8 +24,9 @@ SHA-256 或 MD5 只能说明字节和清单一致。清单本身必须来自带�
 | --- | --- |
 | `include/fsd/` | 对外头文件：状态码、清单、HTTPS 传输、下载编排、SHA-256 |
 | `src/` | 对应实现和命令行入口 `main.cc` |
+| `tests/` | GTest 单元测试，按模块一个测试可执行文件，ctest 编排 |
 | `examples/demo_package.manifest` | 示例清单，用 example.com 的页面充当占位负载 |
-| `3rdparty/` | curl 与 OpenSSL 的源码。由 `3rdparty/fetch.sh` 按固定标签获取 |
+| `3rdparty/` | curl、OpenSSL 与 googletest 的源码。由 `3rdparty/fetch.sh` 按固定标签获取 |
 | `CMakeLists.txt` | C++20 工程，静态链接 `3rdparty` 里的 curl 和 OpenSSL |
 | `.clang-format` | 以 Google C++ Style Guide 为基准，语言标准锁定为 C++20 |
 
@@ -39,6 +40,7 @@ SHA-256 或 MD5 只能说明字节和清单一致。清单本身必须来自带�
 | CMake | 3.22.1 | 本机构建工具。工程要求不低于 3.16 |
 | libcurl | 8.23.0 | 标签 `curl-8_23_0`。OpenSSL 后端，只允许 HTTPS |
 | OpenSSL | 3.5.9 | 标签 `openssl-3.5.9`，3.5 LTS。EVP SHA-256 |
+| GoogleTest | 1.17.0 | 标签 `v1.17.0`。单元测试框架，ctest 编排 |
 | clang-format | 14.0.0 | 只按 `.clang-format` 格式化源码，不参与链接 |
 
 这套 curl 没有编入 nghttp2，HTTPS 走 HTTP/1.1。库支持 HTTP/2 时才会协商 HTTP/2。
@@ -54,6 +56,35 @@ cmake --build build
 ```
 
 未指定构建类型时默认为 Release。可执行文件是 `build/firmware_secure_download`。
+
+## 测试
+
+单元测试基于 GoogleTest（源码同样由 `fetch.sh` 按固定标签拉到 `3rdparty/googletest`，校验 SHA-256），由 CTest 编排：每个 `TEST` 用例都是一条独立的 ctest 记录。构建默认带测试，`-DBUILD_TESTING=OFF` 可整体关闭。
+
+```bash
+./3rdparty/fetch.sh          # 首次，会一并拉取 googletest
+cmake -S . -B build
+cmake --build build
+ctest --test-dir build --output-on-failure
+```
+
+`./scripts/verify.sh` 会按「拉源码 → 配置 → 构建 → `--self-test` → ctest」一条龙跑完。
+
+每个模块一个测试可执行文件，覆盖内容如下：
+
+| 测试目标 | ctest 前缀 | 覆盖内容 |
+| --- | --- | --- |
+| `tests/test_text_util.cc` | `fsd_test_text_util` | Trim、大小写比较、`ParseUint64`/`ParseLong` 的符号、垃圾与溢出拒绝 |
+| `tests/test_status.cc` | `fsd_test_status` | Status 语义、退出码与枚举值契约、错误码命名 |
+| `tests/test_url.cc` | `fsd_test_url` | HTTPS 白名单、主机/端口/IPv6/百分号编码校验、重定向合并与 `..` 段消解 |
+| `tests/test_sha256.cc` | `fsd_test_sha256` | FIPS 180-4 向量（含百万 'a'）、分块一致性、规范化与比较、文件哈希 IO 错误 |
+| `tests/test_md5.cc` | `fsd_test_md5` | RFC 1321 官方七条向量、分块一致性、规范化与比较、文件哈希 IO 错误 |
+| `tests/test_manifest.cc` | `fsd_test_manifest` | 完整解析、BOM/CRLF、必填字段、未知/重复字段、非法数值、64 KiB 与行数上限 |
+| `tests/test_http_client.cc` | `fsd_test_http_client` | 参数校验、明文协议拒绝、连接被拒映射为 network（不依赖服务器） |
+| `tests/test_secure_downloader.cc` | `fsd_test_secure_downloader` | 下载参数校验矩阵、失败清理（无 `.part` 残留）、已有输出不被破坏 |
+| （根 CMake 注册） | `fsd_self_test` | 原有 `--self-test` 运行时自检 |
+
+只跑某一组：`ctest -R fsd_test_url --output-on-failure`。涉及网络/TLS/真实下载的行为不在单元测试范围，按仓库约定在真机上验证。
 
 ## 运行
 

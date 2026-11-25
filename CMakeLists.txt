@@ -96,69 +96,93 @@ ExternalProject_Add(curl_ep
   BUILD_BYPRODUCTS "${FSD_CURL_LIB}"
 )
 
-add_executable(firmware_secure_download
+# 模块库：摘要、清单、URL、HTTPS 传输与下载编排。命令行入口和 GTest
+# 单元测试都链接它，测试不必再编一份模块源码。
+add_library(fsd_core STATIC
   src/sha256.cc
   src/md5.cc
   src/manifest.cc
   src/http_client.cc
   src/url.cc
-  src/secure_downloader.cc
-  src/main.cc)
+  src/secure_downloader.cc)
 
-add_dependencies(firmware_secure_download curl_ep)
+add_dependencies(fsd_core curl_ep)
 
-target_include_directories(firmware_secure_download
-  PRIVATE
+target_include_directories(fsd_core
+  PUBLIC
     "${CMAKE_CURRENT_SOURCE_DIR}/include"
+  PRIVATE
     "${FSD_TP_INSTALL}/include")
 
-# clangd 用 Clang 解析，并按自己猜测的 GCC 版本找标准库。把当前编译器的
-# 实际搜索路径写进编译数据库，跳转才能进入 libstdc++、curl 和 OpenSSL。
-execute_process(
-  COMMAND ${CMAKE_CXX_COMPILER} -E -x c++ - -v
-  INPUT_FILE /dev/null
-  OUTPUT_VARIABLE FSD_CXX_VERBOSE_OUT
-  ERROR_VARIABLE FSD_CXX_VERBOSE_ERR)
-set(FSD_CXX_VERBOSE "${FSD_CXX_VERBOSE_OUT}\n${FSD_CXX_VERBOSE_ERR}")
-string(FIND "${FSD_CXX_VERBOSE}" "#include <...> search starts here:" fsd_inc_begin)
-string(FIND "${FSD_CXX_VERBOSE}" "End of search list." fsd_inc_end)
-if(fsd_inc_begin GREATER -1 AND fsd_inc_end GREATER fsd_inc_begin)
-  math(EXPR fsd_inc_len "${fsd_inc_end} - ${fsd_inc_begin}")
-  string(SUBSTRING "${FSD_CXX_VERBOSE}" ${fsd_inc_begin} ${fsd_inc_len} fsd_inc_block)
-  string(REPLACE "\n" ";" FSD_CXX_SYSTEM_INCLUDES "${fsd_inc_block}")
-  foreach(fsd_system_include ${FSD_CXX_SYSTEM_INCLUDES})
-    string(STRIP "${fsd_system_include}" fsd_system_include)
-    if(fsd_system_include MATCHES "^/" AND IS_DIRECTORY "${fsd_system_include}")
-      # 用编译选项而不是 include_directories，避免 CMake 把隐式系统路径从
-      # compile_commands.json 里删掉。
-      target_compile_options(firmware_secure_download PRIVATE
-        "SHELL:-isystem ${fsd_system_include}")
-    endif()
-  endforeach()
-endif()
-
-target_link_libraries(firmware_secure_download
-  PRIVATE
+target_link_libraries(fsd_core
+  PUBLIC
     "${FSD_CURL_LIB}"
     "${FSD_OPENSSL_SSL}"
     "${FSD_OPENSSL_CRYPTO}"
+  PRIVATE
     pthread
     dl)
 
-target_compile_options(firmware_secure_download PRIVATE
-  -Wall
-  -Wextra
-  -Wpedantic
-  -Wshadow
-  -Wconversion
-  -Wsign-conversion
-  -Wnon-virtual-dtor
-  -Wold-style-cast
-  -Woverloaded-virtual
-  -Wnull-dereference
-  -Wdouble-promotion
-  -Wformat=2
-  -Wimplicit-fallthrough)
+add_executable(firmware_secure_download
+  src/main.cc)
+
+target_link_libraries(firmware_secure_download
+  PRIVATE
+    fsd_core)
+
+# clangd 用 Clang 解析，并按自己猜测的 GCC 版本找标准库。把当前编译器的
+# 实际搜索路径写进编译数据库，跳转才能进入 libstdc++、curl 和 OpenSSL。
+function(fsd_add_system_include_hints target)
+  execute_process(
+    COMMAND ${CMAKE_CXX_COMPILER} -E -x c++ - -v
+    INPUT_FILE /dev/null
+    OUTPUT_VARIABLE FSD_CXX_VERBOSE_OUT
+    ERROR_VARIABLE FSD_CXX_VERBOSE_ERR)
+  set(FSD_CXX_VERBOSE "${FSD_CXX_VERBOSE_OUT}\n${FSD_CXX_VERBOSE_ERR}")
+  string(FIND "${FSD_CXX_VERBOSE}" "#include <...> search starts here:"
+    fsd_inc_begin)
+  string(FIND "${FSD_CXX_VERBOSE}" "End of search list." fsd_inc_end)
+  if(fsd_inc_begin GREATER -1 AND fsd_inc_end GREATER fsd_inc_begin)
+    math(EXPR fsd_inc_len "${fsd_inc_end} - ${fsd_inc_begin}")
+    string(SUBSTRING "${FSD_CXX_VERBOSE}" ${fsd_inc_begin} ${fsd_inc_len}
+      fsd_inc_block)
+    string(REPLACE "\n" ";" FSD_CXX_SYSTEM_INCLUDES "${fsd_inc_block}")
+    foreach(fsd_system_include ${FSD_CXX_SYSTEM_INCLUDES})
+      string(STRIP "${fsd_system_include}" fsd_system_include)
+      if(fsd_system_include MATCHES "^/" AND IS_DIRECTORY "${fsd_system_include}")
+        # 用编译选项而不是 include_directories，避免 CMake 把隐式系统路径从
+        # compile_commands.json 里删掉。
+        target_compile_options(${target} PRIVATE
+          "SHELL:-isystem ${fsd_system_include}")
+      endif()
+    endforeach()
+  endif()
+endfunction()
+
+fsd_add_system_include_hints(fsd_core)
+fsd_add_system_include_hints(firmware_secure_download)
+
+# 业务代码沿用这一组严格告警开关。测试目标只挂 -Wall -Wextra，
+# 避免和 gtest 头文件互相纠缠。
+function(fsd_apply_strict_warnings target)
+  target_compile_options(${target} PRIVATE
+    -Wall
+    -Wextra
+    -Wpedantic
+    -Wshadow
+    -Wconversion
+    -Wsign-conversion
+    -Wnon-virtual-dtor
+    -Wold-style-cast
+    -Woverloaded-virtual
+    -Wnull-dereference
+    -Wdouble-promotion
+    -Wformat=2
+    -Wimplicit-fallthrough)
+endfunction()
+
+fsd_apply_strict_warnings(fsd_core)
+fsd_apply_strict_warnings(firmware_secure_download)
 
 target_compile_definitions(firmware_secure_download PRIVATE
   FSD_VERSION="${PROJECT_VERSION}")
@@ -169,4 +193,16 @@ if(CMAKE_EXPORT_COMPILE_COMMANDS)
     "${CMAKE_BINARY_DIR}/compile_commands.json"
     "${CMAKE_SOURCE_DIR}/compile_commands.json"
     SYMBOLIC)
+endif()
+
+# 单元测试：GoogleTest + ctest。gtest 源码由 3rdparty/fetch.sh 按固定
+# 标签拉到 3rdparty/googletest；-DBUILD_TESTING=OFF 可以整体关掉。
+option(BUILD_TESTING "Build the GoogleTest unit tests" ON)
+if(BUILD_TESTING)
+  enable_testing()
+  add_subdirectory(tests)
+  # 原有运行时自检也纳入 ctest 编排，保持「--self-test 退出码 0」这条底线。
+  add_test(NAME fsd_self_test
+           COMMAND firmware_secure_download --self-test)
+  set_tests_properties(fsd_self_test PROPERTIES TIMEOUT 120)
 endif()

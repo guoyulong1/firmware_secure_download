@@ -8,9 +8,10 @@
 # clangd 本地索引。
 /.cache/
 
-# OpenSSL 与 curl 由 3rdparty/fetch.sh 按固定标签下载，不入库。
+# OpenSSL、curl 与 googletest 由 3rdparty/fetch.sh 按固定标签下载，不入库。
 /3rdparty/openssl/
 /3rdparty/curl/
+/3rdparty/googletest/
 /3rdparty/.cache/
 
 # SSH 密钥与临时 Python 依赖（本机/沙箱专用，绝不可入库）。

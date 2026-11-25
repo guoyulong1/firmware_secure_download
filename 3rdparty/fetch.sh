@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Author: GuoYuLong
 # 下载与上游 Git 标签对应的官方源码包：
-#   openssl/openssl  openssl-3.5.9
-#   curl/curl        curl-8_23_0（发布包版本 8.23.0）
+#   openssl/openssl    openssl-3.5.9
+#   curl/curl          curl-8_23_0（发布包版本 8.23.0）
+#   google/googletest  v1.17.0（单元测试框架，构建测试时需要）
 # 本机访问 GitHub 时 IPv6 会超时，下载固定走 IPv4。归档与对应 Git 标签一致。
 
 set -euo pipefail
@@ -20,6 +21,8 @@ have_tag() {
 # 这两个值来自已经按下列标签解压过的归档。任一镜像字节不同就拒绝。
 openssl_sha256=796831ec533bf41998eaaee9d632d921b8a69f57394fa4086ff01a941113d26d
 curl_sha256=d0605d5883124ef5ae64c6d2b307e1417c482b362583b57491fdf37d9a99a792
+# googletest v1.17.0 的 codeload 归档（本机/目标板实测）。
+googletest_sha256=65fab701d9829d38cb77c14acdc431d2108bfdbf8979e40eb8ae567edf10b27c
 
 sha256_matches() {
   local file="$1"
@@ -104,5 +107,16 @@ else
   extract_to "${work}/curl.tar.gz" "${root}/curl" "curl-8_23_0"
 fi
 
+# googletest 的 GitHub 发布页不提供与 codeload 字节一致的源码包，
+# 这里只走 codeload 一条链路，校验不过就拒绝解压。
+if have_tag "${root}/googletest" "v1.17.0"; then
+  echo "keep googletest v1.17.0"
+else
+  download "${work}/googletest.tar.gz" "${googletest_sha256}" \
+    "https://codeload.github.com/google/googletest/tar.gz/refs/tags/v1.17.0"
+  extract_to "${work}/googletest.tar.gz" "${root}/googletest" "v1.17.0"
+fi
+
 echo "openssl $(cat "${root}/openssl/.fsd-source-tag")"
 echo "curl $(cat "${root}/curl/.fsd-source-tag")"
+echo "googletest $(cat "${root}/googletest/.fsd-source-tag")"
